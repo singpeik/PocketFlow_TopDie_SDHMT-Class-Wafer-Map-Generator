@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgba
 from matplotlib.markers import MarkerStyle
 from pptx import Presentation
+from openpyxl import load_workbook
 
 from flow import create_ioe_flow
 from nodes import CollectIOEInputsNode, GenerateIOEMRBReportNode, GenerateIOEWaferMapNode
@@ -28,10 +29,12 @@ from utils.reporting import (
     _draw_ioe_map,
     _find_edge_dies,
     _interest_bin_marker,
+    _interest_failure_font_style,
     _is_interest_fail,
     _class_map_style,
     _sdhmt_map_style,
     generate_ioe_mrb_summary_ppt,
+    write_wafer_result_summary,
 )
 
 
@@ -74,18 +77,36 @@ class InterestBinTests(unittest.TestCase):
                 self.assertIn('VID to Wafer&WLA', excel.sheet_names)
                 self.assertNotIn('VID to IOE&WLA', excel.sheet_names)
 
+    def test_failure_font_emphasis(self):
+        for column, value, color in (
+            ('SDHMT Whole Fails', '2', '#C00000'),
+            ('Class Edge Fails', '1', '#C65D00'),
+            ('Combined Edge Fail?', 'Yes', '#C65D00'),
+            ('SDHMT IB15 Other FB', '3', '#C00000'),
+            ('Class IB36', '1', '#C00000'),
+        ):
+            with self.subTest(column=column):
+                self.assertEqual(_interest_failure_font_style({}, column, value),
+                                 {'bold': True, 'font_color': color})
+        for column, value in (('SDHMT Whole Fails', '0'), ('Class Edge Fails', '0'),
+                              ('Combined Edge Fail?', 'No'), ('Class Edge Fail?', 'Unknown'),
+                              ('Total Die Tested', '100'), ('Test %', '70.0%')):
+            self.assertIsNone(_interest_failure_font_style({}, column, value))
+
     def test_edge_geometry_and_union(self):
         edge_dies = _find_edge_dies(self.geometry)
-        self.assertEqual(len(edge_dies), 8)
-        self.assertNotIn((1, 1), edge_dies)
+        self.assertEqual(len(edge_dies), 9)
+        self.assertIn((1, 1), edge_dies)
+        self.assertEqual(len(_find_edge_dies(self.geometry, layers=1)), 8)
         summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(self.rows), self.geometry)
         for test_name in ('SDHMT', 'Class'):
             self.assertEqual(summary[f'{test_name} Whole Fails'], 2)
-            self.assertEqual(summary[f'{test_name} Edge Fails'], 1)
+            self.assertEqual(summary[f'{test_name} Edge Fails'], 2)
         self.assertEqual(summary['Combined Whole Fails'], 3)
-        self.assertEqual(summary['Combined Edge Fails'], 2)
+        self.assertEqual(summary['Combined Edge Fails'], 3)
         self.assertEqual(summary['Combined Edge Fail?'], 'Yes')
-        interior = _build_step6_summary_row('TESTLOT_001', pd.DataFrame([self.rows[1]]), self.geometry)
+        interior = _build_step6_summary_row('TESTLOT_001', pd.DataFrame([self.rows[1]]),
+                            [(x, y) for x in range(-2, 5) for y in range(-2, 5)])
         self.assertEqual(interior['Combined Edge Fail?'], 'No')
 
     def test_combined_map_preserves_either_failure(self):
@@ -95,7 +116,7 @@ class InterestBinTests(unittest.TestCase):
 
     def test_outer_edge_excludes_enclosed_holes(self):
         full_geometry = {(x, y) for x in range(-3, 4) for y in range(-3, 4)}
-        expected = {(x, y) for x, y in full_geometry if abs(x) == 3 or abs(y) == 3}
+        expected = {(x, y) for x, y in full_geometry if abs(x) >= 2 or abs(y) >= 2}
         geometry = full_geometry - {(0, 0), (1, 0)}
         self.assertEqual(_find_edge_dies(geometry), expected)
         hole_neighbor = pd.DataFrame([{'X_LOCATION': -1, 'Y_LOCATION': 0, 'SDHMT IB': 36}])
@@ -110,6 +131,24 @@ class InterestBinTests(unittest.TestCase):
         self.assertIn((3, 3), edges)
         self.assertIn((2, 1), edges)
         self.assertNotIn((4, 4), edges)
+
+    def test_two_layer_edge_band(self):
+        geometry = {(x, y) for x in range(9) for y in range(9)} - {(4, 4)}
+        outer = _find_edge_dies(geometry, layers=1)
+        band = _find_edge_dies(geometry)
+        self.assertEqual(len(outer), 32)
+        self.assertEqual(len(band), 56)
+        self.assertTrue(outer < band <= geometry)
+        self.assertIn((1, 4), band)
+        self.assertNotIn((2, 4), band)
+        self.assertNotIn((3, 4), band)
+        rows = [{'X_LOCATION': 1, 'Y_LOCATION': 4, 'SDHMT IB': 36},
+                {'X_LOCATION': 2, 'Y_LOCATION': 4, 'SDHMT IB': 36}]
+        summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(rows), geometry)
+        self.assertEqual(summary['SDHMT Edge Fails'], 1)
+        for invalid in (0, -1, 1.5, True):
+            with self.assertRaises(ValueError):
+                _find_edge_dies(geometry, layers=invalid)
 
     def test_tested_die_counts(self):
         rows = [
@@ -177,11 +216,11 @@ class InterestBinTests(unittest.TestCase):
         summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(rows), self.geometry)
         for test_name in ('SDHMT', 'Class'):
             self.assertEqual(summary[f'{test_name} Whole Fails'], 4)
-            self.assertEqual(summary[f'{test_name} Edge Fails'], 3)
+            self.assertEqual(summary[f'{test_name} Edge Fails'], 4)
             for category in ('IB15 FB1590-1599', 'IB15 Other FB', 'IB15 Missing FB', 'IB36'):
                 self.assertEqual(summary[f'{test_name} {category}'], 1)
         self.assertEqual(summary['Combined Whole Fails'], 4)
-        self.assertEqual(summary['Combined Edge Fails'], 3)
+        self.assertEqual(summary['Combined Edge Fails'], 4)
         self.assertEqual(summary['Combined IB15 FB1590-1599'], 2)
         self.assertEqual(summary['Combined IB15 Other FB'], 2)
         self.assertEqual(summary['Combined IB15 Missing FB'], 1)
@@ -273,6 +312,64 @@ class InterestBinTests(unittest.TestCase):
                     self.assertEqual(Path(report_prep['ioe_map_path']), path)
                     self.assertIn(f'{product} MRB', Path(report_prep['mrb_ppt_output']).name)
 
+    def test_excel_summary_table_and_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'Final.xlsx'
+            pd.DataFrame(self.rows).to_excel(path, sheet_name='CATTS-cleaned', index=False)
+            workbook = load_workbook(path)
+            workbook.create_sheet('Notes')['A1'] = '=1+1'
+            workbook.save(path)
+            workbook.close()
+            summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(self.rows), self.geometry)
+            second = {**summary, 'LOT7_WID3': 'TESTLOT_002'}
+            self.assertEqual(write_wafer_result_summary(path, [summary, second]), 'Result Summary')
+            workbook = load_workbook(path)
+            try:
+                self.assertEqual(workbook['Notes']['A1'].value, '=1+1')
+                self.assertEqual(workbook['CATTS-cleaned'].max_row, len(self.rows) + 1)
+                sheet = workbook['Result Summary']
+                headers = [cell.value for cell in sheet[1]]
+                self.assertEqual(headers[:4], ['LOT7_WID3', 'Wafer Map Dies', 'Total Die Tested', 'Test %'])
+                self.assertEqual(sheet.freeze_panes, 'B2')
+                self.assertEqual(sheet.max_row, 3)
+                table = next(iter(sheet.tables.values()))
+                self.assertEqual(table.ref, sheet.dimensions)
+                self.assertEqual(table.autoFilter.ref, sheet.dimensions)
+                self.assertAlmostEqual(sheet['D2'].value, 1 / 3)
+                self.assertEqual(sheet['D2'].number_format, '0.0%')
+                self.assertIn('Class IB15 Other FB', headers)
+                for column, color in (('SDHMT Whole Fails', '00C00000'),
+                                      ('SDHMT Edge Fails', '00C65D00')):
+                    cell = sheet.cell(2, headers.index(column) + 1)
+                    self.assertTrue(cell.font.bold)
+                    self.assertEqual(cell.font.color.rgb, color)
+                self.assertFalse(sheet['C2'].font.bold)
+            finally:
+                workbook.close()
+            write_wafer_result_summary(path, [second])
+            workbook = load_workbook(path)
+            try:
+                self.assertEqual(workbook.sheetnames.count('Result Summary'), 1)
+                self.assertEqual(workbook['Result Summary'].max_row, 2)
+                self.assertEqual(workbook['Result Summary']['A2'].value, 'TESTLOT_002')
+                self.assertEqual(workbook['Notes']['A1'].value, '=1+1')
+            finally:
+                workbook.close()
+
+    def test_excel_summary_failure_preserves_workbook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'Final.xlsx'
+            pd.DataFrame(self.rows).to_excel(path, sheet_name='CATTS-cleaned', index=False)
+            original = path.read_bytes()
+            summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(self.rows), self.geometry)
+            with patch('utils.reporting.os.replace', side_effect=PermissionError('Workbook locked')):
+                with self.assertRaises(PermissionError):
+                    write_wafer_result_summary(path, [summary])
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(Path(directory).glob('*.xlsx')), [path])
+            with self.assertRaises(ValueError):
+                write_wafer_result_summary(path, [])
+
     def test_gpu_ppt_output(self):
         self._check_ppt_output('GPU')
 
@@ -290,6 +387,12 @@ class InterestBinTests(unittest.TestCase):
             result = generate_ioe_mrb_summary_ppt(workbook, map_path, folder / 'summary.pptx', folder)
             self.assertEqual(result['wafer_count'], 1)
             self.assertEqual(result['mdk_outputs'], [])
+            self.assertEqual(result['summary_sheet'], 'Result Summary')
+            excel_summary = pd.read_excel(workbook, sheet_name='Result Summary')
+            self.assertEqual(excel_summary.iloc[0]['Total Die Tested'], 3)
+            self.assertAlmostEqual(excel_summary.iloc[0]['Test %'], 1 / 3)
+            self.assertEqual(excel_summary.iloc[0]['Combined Edge Fails'],
+                             result['summary_rows'][0]['Combined Edge Fails'])
             self.assertFalse(list(folder.glob('*.csv')))
             self.assertFalse(list(folder.glob('*.png')))
             presentation = Presentation(result['output_ppt'])
@@ -318,6 +421,24 @@ class InterestBinTests(unittest.TestCase):
             self.assertIn('Test %', table_text)
             self.assertIn('33.3%', table_text)
             self.assertNotIn('Combined Tested Dies', table_text)
+            table = next(shape.table for shape in presentation.slides[1].shapes if shape.has_table)
+            headers = [cell.text for cell in table.rows[0].cells]
+            for name, color in (('SDHMT Whole Fails', 'C00000'),
+                                ('SDHMT Edge Fails', 'C65D00'),
+                                ('SDHMT Edge Fail?', 'C65D00')):
+                run = table.cell(1, headers.index(name)).text_frame.paragraphs[0].runs[0]
+                self.assertTrue(run.font.bold)
+                self.assertEqual(str(run.font.color.rgb), color)
+            neutral = table.cell(1, headers.index('Total Die Tested')).text_frame.paragraphs[0].runs[0]
+            self.assertFalse(neutral.font.bold)
+            caption = next(shape for shape in presentation.slides[2].shapes
+                           if shape.has_text_frame and shape.text.startswith('SDHMT tested dies:'))
+            runs = caption.text_frame.paragraphs[0].runs
+            self.assertFalse(runs[0].font.bold)
+            self.assertEqual(str(runs[1].font.color.rgb), 'C00000')
+            self.assertTrue(runs[1].font.bold)
+            self.assertEqual(str(runs[2].font.color.rgb), 'C65D00')
+            self.assertTrue(runs[2].font.bold)
             self.assertIn('SDHMT tested dies: 3', slide_text)
             self.assertIn('Class tested dies: 3', slide_text)
             self.assertIn('Either-test tested dies: 3', slide_text)

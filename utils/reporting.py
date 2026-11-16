@@ -5,6 +5,12 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from openpyxl import load_workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.table import Table, TableStyleInfo
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
@@ -473,7 +479,9 @@ def _interest_bin_marker(row, test_name):
             'IB15 Other FB': 'v', 'IB15 Missing FB': 'v'}.get(_interest_bin_category(row, test_name))
 
 
-def _find_edge_dies(active_dies):
+def _find_edge_dies(active_dies, layers=2):
+    if not isinstance(layers, int) or isinstance(layers, bool) or layers < 1:
+        raise ValueError('Edge width must be a positive integer number of die layers.')
     geometry = set(active_dies)
     if not geometry:
         raise ValueError('The full wafer geometry is required to identify edge dies.')
@@ -491,12 +499,23 @@ def _find_edge_dies(active_dies):
                     and neighbor not in geometry and neighbor not in exterior):
                 exterior.add(neighbor)
                 pending.append(neighbor)
-    return {
+    edge_dies = {
         (x, y) for x, y in geometry
         if any(neighbor in exterior for neighbor in (
             (x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)
         ))
     }
+    frontier = edge_dies.copy()
+    for _ in range(layers - 1):
+        frontier = {
+            neighbor for x, y in frontier
+            for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1))
+            if neighbor in geometry and neighbor not in edge_dies
+        }
+        edge_dies.update(frontier)
+        if not frontier:
+            break
+    return edge_dies
 
 
 def _parse_dieindex_coordinates(intel_die_index):
@@ -764,13 +783,89 @@ def _build_step6_summary_row(lot7_wid3, wafer_df, active_dies):
     }
 
 
-def _bin_breakdown_caption(summary_row, test_name):
-    return (
-        f"IB15 FB1590-1599: {summary_row[f'{test_name} IB15 FB1590-1599']} | "
-        f"IB15 other FB: {summary_row[f'{test_name} IB15 Other FB']} | "
-        f"IB15 missing FB: {summary_row[f'{test_name} IB15 Missing FB']} | "
-        f"IB36: {summary_row[f'{test_name} IB36']}"
-    )
+def _interest_failure_font_style(_row, column_name, value_text):
+    if column_name.endswith(' Edge Fail?'):
+        return {'bold': True, 'font_color': '#C65D00'} if value_text == 'Yes' else None
+    count = _coerce_bin_value(value_text)
+    if count is None or count <= 0:
+        return None
+    if column_name.endswith(' Edge Fails'):
+        return {'bold': True, 'font_color': '#C65D00'}
+    if (column_name.endswith(' Whole Fails') or ' IB15 ' in column_name
+            or column_name.endswith(' IB36')):
+        return {'bold': True, 'font_color': '#C00000'}
+    return None
+
+
+def write_wafer_result_summary(final_workbook_path, summary_rows):
+    final_workbook = Path(final_workbook_path)
+    summary_df = pd.DataFrame(summary_rows)
+    coverage_columns = ['LOT7_WID3', 'Wafer Map Dies', 'Total Die Tested', 'Test %']
+    if summary_df.empty:
+        raise ValueError('No wafer results are available for the Excel summary.')
+    summary_df = summary_df[coverage_columns + [column for column in summary_df.columns
+                            if column not in coverage_columns and column != 'Combined Tested Dies']]
+    workbook = load_workbook(final_workbook)
+    temporary_path = None
+    sheet_name = 'Result Summary'
+    try:
+        if sheet_name in workbook.sheetnames:
+            del workbook[sheet_name]
+        sheet = workbook.create_sheet(sheet_name, 0)
+        for values in dataframe_to_rows(summary_df, index=False, header=True):
+            sheet.append(values)
+        sheet.freeze_panes = 'B2'
+        table_name = 'WaferResultSummary'
+        existing_names = {name for worksheet in workbook for name in worksheet.tables}
+        while table_name in existing_names:
+            table_name += '_'
+        table = Table(displayName=table_name, ref=sheet.dimensions)
+        table.tableStyleInfo = TableStyleInfo(name='TableStyleMedium2', showRowStripes=True)
+        sheet.add_table(table)
+        for column_index, column_name in enumerate(summary_df.columns, start=1):
+            sheet.column_dimensions[get_column_letter(column_index)].width = min(max(len(column_name) + 2, 16), 30)
+            sheet.cell(1, column_index).font = Font(bold=True, color='FFFFFF')
+            for row_index in range(2, sheet.max_row + 1):
+                cell = sheet.cell(row_index, column_index)
+                if column_name == 'Test %':
+                    cell.number_format = '0.0%'
+                style = _interest_failure_font_style({}, column_name, str(cell.value))
+                if style:
+                    cell.font = Font(bold=True, color=style['font_color'].replace('#', ''))
+        with NamedTemporaryFile(dir=final_workbook.parent, suffix='.xlsx', delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        workbook.save(temporary_path)
+        workbook.close()
+        os.replace(temporary_path, final_workbook)
+    finally:
+        workbook.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return sheet_name
+
+
+def _set_wafer_result_caption(text_frame, summary_row, test_name):
+    prefix = 'Either-test' if test_name == 'Combined' else test_name
+    lines = [
+        [(f'{prefix} tested dies', 'Tested Dies'), ('interest fails', 'Whole Fails'),
+         ('edge fails', 'Edge Fails'), ('edge fail?', 'Edge Fail?')],
+        [('IB15 FB1590-1599', 'IB15 FB1590-1599'), ('IB15 other FB', 'IB15 Other FB'),
+         ('IB15 missing FB', 'IB15 Missing FB'), ('IB36', 'IB36')],
+    ]
+    text_frame.clear()
+    for line_index, metrics in enumerate(lines):
+        paragraph = text_frame.paragraphs[0] if line_index == 0 else text_frame.add_paragraph()
+        for metric_index, (label, suffix) in enumerate(metrics):
+            key = f'{test_name} {suffix}'
+            value = str(summary_row[key])
+            run = paragraph.add_run()
+            separator = ' ' if label.endswith('?') else ': '
+            run.text = (' | ' if metric_index else '') + f'{label}{separator}{value}'
+            run.font.size = Pt(14)
+            style = _interest_failure_font_style(summary_row, key, value)
+            if style:
+                run.font.bold = style['bold']
+                run.font.color.rgb = RGBColor.from_string(style['font_color'].replace('#', ''))
 
 
 def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_path='IOE MRB map summary.pptx', output_dir='.'):
@@ -804,6 +899,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
         summary_row = _build_step6_summary_row(lot7_wid3, wafer_df, active_dies)
         summary_rows.append(summary_row)
 
+    summary_sheet = write_wafer_result_summary(final_workbook, summary_rows)
     summary_df = pd.DataFrame(summary_rows)
     coverage_columns = ['LOT7_WID3', 'Wafer Map Dies', 'Total Die Tested', 'Test %']
     detail_columns = [column for column in summary_df.columns
@@ -824,7 +920,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
         'IB15: FB1590-1599 up-triangle; other/no FB down-triangle\n'
         'IB36: diamond\n'
         'Colors: SDHMT red; Class purple\n'
-        'Edge: exterior perimeter only; enclosed gaps excluded\n'
+        'Edge: two die layers inward from exterior; enclosed gaps excluded\n'
         '1. Whole-wafer and edge-failure summary\n'
         '2. SDHMT wafer maps\n'
         '3. Class wafer maps\n'
@@ -850,6 +946,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
         height=Inches(4.9),
         font_size=Pt(12),
         link_col='LOT7_WID3',
+        row_style_fn=_interest_failure_font_style,
     )
 
     wafer_target_slides = {}
@@ -884,16 +981,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
             width=Inches(2.5),
         )
         tx1 = slide1.shapes.add_textbox(Inches(0.45), Inches(6.68), Inches(12.3), Inches(0.7))
-        tx1.text_frame.text = (
-            f"SDHMT tested dies: {summary_row['SDHMT Tested Dies']} | "
-            f"interest fails: {summary_row['SDHMT Whole Fails']} | "
-            f"edge fails: {summary_row['SDHMT Edge Fails']} | "
-            f"edge fail? {summary_row['SDHMT Edge Fail?']}\n"
-            + _bin_breakdown_caption(summary_row, 'SDHMT')
-        )
-        for paragraph in tx1.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(14)
+        _set_wafer_result_caption(tx1.text_frame, summary_row, 'SDHMT')
 
         slide2 = prs.slides.add_slide(prs.slide_layouts[5])
         slide2.shapes.title.text = f'{product_name} {lot7_wid3} Class result'
@@ -913,16 +1001,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
             width=Inches(2.5),
         )
         tx2 = slide2.shapes.add_textbox(Inches(0.45), Inches(6.68), Inches(12.3), Inches(0.7))
-        tx2.text_frame.text = (
-            f"Class tested dies: {summary_row['Class Tested Dies']} | "
-            f"interest fails: {summary_row['Class Whole Fails']} | "
-            f"edge fails: {summary_row['Class Edge Fails']} | "
-            f"edge fail? {summary_row['Class Edge Fail?']}\n"
-            + _bin_breakdown_caption(summary_row, 'Class')
-        )
-        for paragraph in tx2.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(14)
+        _set_wafer_result_caption(tx2.text_frame, summary_row, 'Class')
 
         slide3 = prs.slides.add_slide(prs.slide_layouts[5])
         slide3.shapes.title.text = f'{product_name} {lot7_wid3} SDHMT+Class result'
@@ -945,16 +1024,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
             width=Inches(2.55),
         )
         tx3 = slide3.shapes.add_textbox(Inches(0.45), Inches(6.68), Inches(12.3), Inches(0.7))
-        tx3.text_frame.text = (
-            f"Either-test tested dies: {summary_row['Combined Tested Dies']} | "
-            f"interest fails: {summary_row['Combined Whole Fails']} | "
-            f"edge fails: {summary_row['Combined Edge Fails']} | "
-            f"edge fail? {summary_row['Combined Edge Fail?']}\n"
-            + _bin_breakdown_caption(summary_row, 'Combined')
-        )
-        for paragraph in tx3.text_frame.paragraphs:
-            for run in paragraph.runs:
-                run.font.size = Pt(14)
+        _set_wafer_result_caption(tx3.text_frame, summary_row, 'Combined')
 
         for fig_path in [sdhmt_fb_fig, class_fb_fig, combo_fig]:
             if fig_path.exists():
@@ -974,5 +1044,7 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
         'wafer_count': int(len(summary_rows)),
         'mdk_outputs': [],
         'summary_rows': summary_rows,
+        'summary_sheet': summary_sheet,
+        'final_workbook': str(final_workbook),
     }
 

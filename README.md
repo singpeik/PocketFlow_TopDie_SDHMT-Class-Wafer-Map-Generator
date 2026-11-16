@@ -254,6 +254,7 @@ Optional GPU path overrides: `--gpu-map-source` and `--gpu-map-output`. GPU runs
 - Whole-wafer interest-failure counts and outermost edge-failure confirmation for each selected wafer. No new MDK exports are generated.
 
 Required PPT structure:
+- The final workbook also contains a `Result Summary` tab with one row per wafer and the full result breakdown. It is an Excel table with filter/sort dropdowns, a frozen header and wafer-ID column, numeric `0.0%` formatting, and the same red/orange failure highlighting as the PPT. It includes the coverage columns, per-test and combined whole/edge counts, and all IB15/IB36 category counts. Reruns replace only this summary tab; other workbook sheets remain intact. Close the workbook in Excel before reporting so the atomic save can replace it safely.
 - The summary table includes `Wafer Map Dies`, `Total Die Tested`, and `Test %` for each wafer. `Total Die Tested` counts unique dies with an eligible SDHMT or Class result once; `Test % = Total Die Tested / unique active positions in the selected wafer map`. Percentages use one decimal place. The GPU reference currently supplies a denominator of 2,763, not the historical fixed 2,400.
 - First slide must be the summary/title slide.
 - Title must be `IOE wafer test result summary` or `GPU wafer test result summary` for the selected product.
@@ -283,6 +284,8 @@ Edge rule:
 - A die is in the outermost ring when an immediate horizontal or vertical neighbor belongs to exterior empty space. Empty positions are flood-filled from outside the reference bounds; enclosed internal holes do not create edge dies. This rule applies to both IOE and GPU geometry.
 - Report whole-wafer and edge fail counts plus edge-failure Yes/No. If a failing die has missing or out-of-geometry coordinates, report `Unknown` instead of `No` unless another known edge failure already confirms `Yes`.
 - There are no top/bottom-half metrics, disposition decisions, or new MDK files.
+- The edge region is now two die layers wide: the exterior perimeter plus one adjacent horizontal/vertical active-die layer inward. Enclosed holes do not seed edge bands. The 257-die figure above describes only the original outermost layer.
+- Summary tables and wafer captions emphasize positive whole-wafer interest-failure counts in bold red and positive edge-band counts/Yes indicators in bold orange. Zero counts, No/Unknown indicators, tested quantities, and Test % remain neutral; these colors are not scrap/release advice.
 
 Combined-map precedence rule:
 - Keep an interest failure from either test even if the other test is good or fails a different bin.

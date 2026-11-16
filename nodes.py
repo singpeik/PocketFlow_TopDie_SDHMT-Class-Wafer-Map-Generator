@@ -745,6 +745,7 @@ class GenerateIOEMRBReportNode(Node):
         print(
             f"Generated Step 6 wafer test result PPT for {result['wafer_count']} wafer(s) at {result['output_ppt']}."
         )
+        print(f"Excel summary: {result['final_workbook']} [{result['summary_sheet']}].")
         return result
 
     def post(self, shared, prep_res, exec_res):
@@ -765,12 +766,13 @@ class GenerateIOEMRBReportNode(Node):
                 "Wafer Test Result Report Complete",
                 (
                     f"Test result PPT: {exec_res['output_ppt']}\n"
+                    f"Excel summary tab: {exec_res.get('summary_sheet', 'Result Summary')}\n"
                     f"Wafer count: {exec_res['wafer_count']}\n"
                     "Interest: all IB15 and IB36 results\n"
                     "IB15 FB1590-1599: up triangle; other/no FB: down triangle\n"
                     "IB36: diamond\n"
                     "SDHMT: red; Class: purple\n"
-                    "Whole-wafer and outermost edge-die failures reported\n"
+                    "Whole-wafer and two-layer exterior edge-band failures reported\n"
                     f"Intermediate files removed: {len(cleanup_paths)}"
                 ),
                 parent=root,
