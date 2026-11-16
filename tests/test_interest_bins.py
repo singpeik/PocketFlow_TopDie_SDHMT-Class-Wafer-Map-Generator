@@ -17,6 +17,7 @@ from utils.ioe_workflow import (
     VID_TO_IOE_WLA_SHEET,
     _replace_excel_sheet,
     build_ioe_wafer_map,
+    consolidate_final_workbooks,
     normalize_lot7_wid3,
     normalize_lot7_wid3_list,
 )
@@ -30,11 +31,18 @@ from utils.reporting import (
     _find_edge_dies,
     _interest_bin_marker,
     _interest_failure_font_style,
+    _select_ppt_summary_rows,
+    _add_wafer_summary_slides,
+    _add_failure_overview_slide,
+    _add_detailed_failure_overview_slide,
+    FAILURE_OVERVIEW_COLUMNS,
     _is_interest_fail,
     _class_map_style,
     _sdhmt_map_style,
     generate_ioe_mrb_summary_ppt,
     write_wafer_result_summary,
+    retain_combined_map_slides,
+    add_internal_link,
 )
 
 
@@ -312,6 +320,135 @@ class InterestBinTests(unittest.TestCase):
                     self.assertEqual(Path(report_prep['ioe_map_path']), path)
                     self.assertIn(f'{product} MRB', Path(report_prep['mrb_ppt_output']).name)
 
+    def test_failure_overview_is_one_page_and_excludes_non_failing_wafers(self):
+        frame = pd.DataFrame([
+            {'LOT7_WID3': 'TESTLOT_001', 'Combined Whole Fails': 1, 'Combined Edge Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_002', 'Combined Whole Fails': 0, 'Combined Edge Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_003', 'Combined Whole Fails': 3, 'Combined Edge Fails': 2},
+        ])
+        presentation = Presentation()
+        slide, links = _add_failure_overview_slide(presentation, frame, 'GPU')
+        self.assertEqual(len(presentation.slides), 1)
+        self.assertEqual(list(links), ['TESTLOT_003', 'TESTLOT_001'])
+        text = '\n'.join(shape.text for shape in slide.shapes if shape.has_text_frame)
+        self.assertIn('Combined Whole Fails > 0 only', text)
+        self.assertNotIn('TESTLOT_002', text)
+        table = next(shape.table for shape in slide.shapes if shape.has_table)
+        self.assertEqual([cell.text for cell in table.rows[0].cells], ['Wafer ID', 'Whole Fails', 'Edge Fails'])
+        self.assertEqual([cell.text for cell in table.rows[1].cells], ['TESTLOT_003', '3', '2'])
+        self.assertNotIn('TESTLOT_002', [row.cells[0].text for row in list(table.rows)[1:]])
+        edge_run = table.cell(2, 2).text_frame.paragraphs[0].runs[0]
+        self.assertFalse(edge_run.font.bold)
+
+    def test_failure_overview_large_list_stays_within_slide(self):
+        frame = pd.DataFrame([{'LOT7_WID3': f'TESTLOT_{index:03}', 'Combined Whole Fails': 1,
+                               'Combined Edge Fails': 0} for index in range(168)])
+        presentation = Presentation()
+        presentation.slide_width = 12192000
+        presentation.slide_height = 6858000
+        slide, links = _add_failure_overview_slide(presentation, frame, 'GPU')
+        self.assertEqual(len(presentation.slides), 1)
+        self.assertEqual(len(links), 168)
+        for shape in slide.shapes:
+            self.assertLessEqual(shape.left + shape.width, presentation.slide_width)
+            self.assertLessEqual(shape.top + shape.height, presentation.slide_height)
+
+    def test_detailed_overview_uses_exact_requested_columns_for_38_wafers(self):
+        summary = _build_step6_summary_row('TESTLOT_001', pd.DataFrame(self.rows), self.geometry)
+        records = [{**summary, 'LOT7_WID3': f'TESTLOT_{index:03}'} for index in range(38)]
+        records.append({**summary, 'LOT7_WID3': 'NOFAILS_999', 'Combined Whole Fails': 0})
+        presentation = Presentation()
+        presentation.slide_width = 12192000
+        presentation.slide_height = 6858000
+        slide, links = _add_detailed_failure_overview_slide(presentation, pd.DataFrame(records), 'GPU')
+        self.assertEqual(len(presentation.slides), 1)
+        tables = [shape for shape in slide.shapes if shape.has_table]
+        self.assertEqual(len(tables), 1)
+        table = tables[0].table
+        self.assertEqual([cell.text for cell in table.rows[0].cells], FAILURE_OVERVIEW_COLUMNS)
+        self.assertEqual(len(table.rows), 39)
+        self.assertLessEqual(slide.shapes.title.top + slide.shapes.title.height, tables[0].top)
+        self.assertEqual(table.cell(1, 2).text, '33.3%')
+        self.assertEqual(len(links), 38)
+        self.assertNotIn('NOFAILS_999', links)
+        for shape in slide.shapes:
+            self.assertLessEqual(shape.left + shape.width, presentation.slide_width)
+            self.assertLessEqual(shape.top + shape.height, presentation.slide_height)
+        run = table.cell(1, FAILURE_OVERVIEW_COLUMNS.index('SDHMT IB36')).text_frame.paragraphs[0].runs[0]
+        self.assertTrue(run.font.bold)
+        self.assertEqual(str(run.font.color.rgb), 'C00000')
+
+    def test_ppt_summary_keeps_all_rows_when_they_fit(self):
+        frame = pd.DataFrame([
+            {'LOT7_WID3': 'TESTLOT_001', 'Test %': 0, 'Combined Whole Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_002', 'Test %': 0.5, 'Combined Whole Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_003', 'Test %': 0.5, 'Combined Whole Fails': 1},
+        ])
+        selected, note = _select_ppt_summary_rows(frame, max_rows=3)
+        pd.testing.assert_frame_equal(selected, frame)
+        self.assertEqual(note, '')
+
+    def test_ppt_summary_removes_only_zero_test_rows_when_sufficient(self):
+        frame = pd.DataFrame([
+            {'LOT7_WID3': 'TESTLOT_001', 'Test %': 0, 'Combined Whole Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_002', 'Test %': 0.00001, 'Combined Whole Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_003', 'Test %': 0.5, 'Combined Whole Fails': 0},
+            {'LOT7_WID3': 'TESTLOT_004', 'Test %': 0.5, 'Combined Whole Fails': 1},
+        ])
+        selected, note = _select_ppt_summary_rows(frame, max_rows=3)
+        self.assertEqual(selected['LOT7_WID3'].tolist(), ['TESTLOT_002', 'TESTLOT_003', 'TESTLOT_004'])
+        self.assertIn('Test %=0%', note)
+        self.assertNotIn('Only wafers with interest-bin failures', note)
+        self.assertEqual(len(frame), 4)
+
+    def test_ppt_summary_filters_non_failures_only_on_remaining_overflow(self):
+        frame = pd.DataFrame([
+            {'LOT7_WID3': f'TESTLOT_{index:03}', 'Test %': 0.5,
+             'Combined Whole Fails': 1 if index in (1, 4) else 0}
+            for index in range(5)
+        ])
+        selected, note = _select_ppt_summary_rows(frame, max_rows=3)
+        self.assertEqual(selected['LOT7_WID3'].tolist(), ['TESTLOT_001', 'TESTLOT_004'])
+        self.assertIn('Only wafers with interest-bin failures are shown in this table.', note)
+
+    def test_ppt_summary_paginates_without_losing_failure_rows_or_links(self):
+        frame = pd.DataFrame([
+            {'LOT7_WID3': f'TESTLOT_{index:03}', 'Wafer Map Dies': 9,
+             'Total Die Tested': 3, 'Test %': 1 / 3, 'Combined Whole Fails': 1}
+            for index in range(17)
+        ])
+        presentation = Presentation()
+        presentation.slide_width = 12192000
+        presentation.slide_height = 6858000
+        links = _add_wafer_summary_slides(presentation, frame, 'GPU')
+        self.assertEqual(len(presentation.slides), 2)
+        self.assertEqual(set(links), set(frame['LOT7_WID3']))
+        seen = []
+        for slide in presentation.slides:
+            table_shape = next(shape for shape in slide.shapes if shape.has_table)
+            self.assertLessEqual(len(table_shape.table.rows) - 1, 15)
+            self.assertLessEqual(table_shape.top + table_shape.height, presentation.slide_height)
+            self.assertLessEqual(table_shape.left + table_shape.width, presentation.slide_width)
+            for row in list(table_shape.table.rows)[1:]:
+                wafer = row.cells[0].text
+                seen.append(wafer)
+                source, run = links[wafer]
+                self.assertIs(source, slide)
+                self.assertEqual(run.text, wafer)
+            self.assertTrue(any('Only wafers with interest-bin failures' in shape.text
+                                for shape in slide.shapes if shape.has_text_frame))
+        self.assertEqual(seen, frame['LOT7_WID3'].tolist())
+
+    def test_ppt_summary_empty_filtered_result_is_explained(self):
+        frame = pd.DataFrame([{'LOT7_WID3': f'TESTLOT_{index:03}', 'Test %': 0,
+                               'Combined Whole Fails': 0} for index in range(16)])
+        presentation = Presentation()
+        links = _add_wafer_summary_slides(presentation, frame, 'GPU')
+        self.assertEqual(links, {})
+        self.assertEqual(len(presentation.slides), 1)
+        self.assertTrue(any('No wafers meet the displayed criteria.' in shape.text
+                            for shape in presentation.slides[0].shapes if shape.has_text_frame))
+
     def test_excel_summary_table_and_refresh(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'Final.xlsx'
@@ -372,6 +509,98 @@ class InterestBinTests(unittest.TestCase):
 
     def test_gpu_ppt_output(self):
         self._check_ppt_output('GPU')
+
+    def test_tested_only_ppt_excludes_zero_test_wafer_but_keeps_excel_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            workbook = folder / 'Final.xlsx'
+            rows = self.rows + [{'FAB_LOT': 'ZEROTST', 'FAB_WAFER': 2,
+                                 'X_LOCATION': 0, 'Y_LOCATION': 0, 'SDHMT IB': 6}]
+            pd.DataFrame(rows).to_excel(workbook, sheet_name='CATTS-cleaned', index=False)
+            map_path = folder / 'geometry.json'
+            with map_path.open('w', encoding='utf-8') as stream:
+                json.dump({'map_name': 'GPU', 'active_dies': self.geometry}, stream)
+            result = generate_ioe_mrb_summary_ppt(workbook, map_path, folder / 'summary.pptx',
+                                                  folder, tested_wafers_only=True, combined_maps_only=True)
+            self.assertEqual(result['total_wafer_count'], 2)
+            self.assertEqual(result['wafer_count'], 1)
+            self.assertEqual(result['excluded_zero_test_wafers'], 1)
+            self.assertEqual(len(pd.read_excel(workbook, sheet_name='Result Summary')), 2)
+            presentation = Presentation(result['output_ppt'])
+            self.assertEqual(len(presentation.slides), 3)
+            table = next(shape.table for shape in presentation.slides[1].shapes if shape.has_table)
+            self.assertEqual(len(table.rows), 2)
+            self.assertEqual(table.cell(1, 0).text, 'TESTLOT_001')
+            self.assertTrue(all('ZEROTST_002' not in slide.shapes.title.text
+                                for slide in presentation.slides))
+            self.assertTrue(presentation.slides[2].shapes.title.text.endswith(' SDHMT+Class result'))
+
+    def test_combined_only_redirects_links_and_preserves_summary_slides(self):
+        presentation = Presentation()
+        summary = presentation.slides.add_slide(presentation.slide_layouts[5])
+        summary.shapes.title.text = 'Summary'
+        sdhmt = presentation.slides.add_slide(presentation.slide_layouts[5])
+        sdhmt.shapes.title.text = 'GPU TESTLOT_001 SDHMT result'
+        klass = presentation.slides.add_slide(presentation.slide_layouts[5])
+        klass.shapes.title.text = 'GPU TESTLOT_001 Class result'
+        combined = presentation.slides.add_slide(presentation.slide_layouts[5])
+        combined.shapes.title.text = 'GPU TESTLOT_001 SDHMT+Class result'
+        for target in (sdhmt, klass):
+            run = summary.shapes.title.text_frame.add_paragraph().add_run()
+            run.text = 'TESTLOT_001'
+            add_internal_link(run, summary, target)
+        self.assertEqual(retain_combined_map_slides(presentation), 2)
+        self.assertEqual(len(presentation.slides), 2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'combined.pptx'
+            presentation.save(path)
+            saved = Presentation(path)
+            source, target = saved.slides[0], saved.slides[1]
+            for paragraph in source.shapes.title.text_frame.paragraphs[1:]:
+                hyperlink = paragraph.runs[0].hyperlink._hlinkClick
+                relationship_id = hyperlink.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                self.assertIs(source.part.rels[relationship_id].target_part, target.part)
+
+    def test_combined_only_refuses_to_drop_wafer_without_combined_map(self):
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+        slide.shapes.title.text = 'GPU TESTLOT_001 SDHMT result'
+        with self.assertRaises(ValueError):
+            retain_combined_map_slides(presentation)
+        self.assertEqual(len(presentation.slides), 1)
+
+    def test_consolidation_preserves_inputs_and_uses_later_duplicate_die(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            first, second, output = folder / 'first.xlsx', folder / 'second.xlsx', folder / 'combined.xlsx'
+            with pd.ExcelWriter(first, engine='openpyxl') as writer:
+                pd.DataFrame(self.rows).to_excel(writer, sheet_name='CATTS-cleaned', index=False)
+                pd.DataFrame({'VISUAL_ID': ['TESTVID001', 'TESTVID002']}).to_excel(writer, sheet_name='VID', index=False)
+                pd.DataFrame({'Note': ['Preserve this source tab']}).to_excel(writer, sheet_name='Notes', index=False)
+                pd.DataFrame({'Old': [999]}).to_excel(writer, sheet_name='Result Summary', index=False)
+            newer = {**self.rows[0], 'Class IB': 36, 'Class FB': 3600}
+            other_wafer = {**self.rows[0], 'FAB_WAFER': 2}
+            with pd.ExcelWriter(second, engine='openpyxl') as writer:
+                pd.DataFrame([newer, other_wafer]).to_excel(writer, sheet_name='CATTS-cleaned', index=False)
+                pd.DataFrame({'VISUAL_ID': ['TESTVID002', 'TESTVID003']}).to_excel(writer, sheet_name='VID', index=False)
+            original_bytes = first.read_bytes(), second.read_bytes()
+            result = consolidate_final_workbooks([first, second], output)
+            self.assertEqual(result['wafer_count'], 2)
+            self.assertEqual(result['die_rows'], 4)
+            self.assertEqual(result['duplicate_die_rows_removed'], 1)
+            merged = pd.read_excel(output, sheet_name='CATTS-cleaned')
+            selected = merged.loc[merged['FAB_WAFER'].eq(1) & merged['X_LOCATION'].eq(0)]
+            self.assertEqual(selected.iloc[0]['Class IB'], 36)
+            with pd.ExcelFile(output) as workbook:
+                self.assertIn('Notes', workbook.sheet_names)
+                self.assertIn('Consolidation Sources', workbook.sheet_names)
+                self.assertNotIn('Result Summary', workbook.sheet_names)
+                self.assertEqual(len(pd.read_excel(workbook, sheet_name='VID')), 3)
+            self.assertEqual((first.read_bytes(), second.read_bytes()), original_bytes)
+            with self.assertRaises(FileExistsError):
+                consolidate_final_workbooks([first, second], output)
+            with self.assertRaises(ValueError):
+                consolidate_final_workbooks([first], first)
 
     def test_ppt_output(self):
         self._check_ppt_output('IOE')
@@ -444,6 +673,83 @@ class InterestBinTests(unittest.TestCase):
             self.assertIn('Either-test tested dies: 3', slide_text)
             for old_label in ('bottom half', 'top half', 'DISPO', 'FB1594', 'FB1591', 'MDK', 'scrap', 'release', 'Hold'):
                 self.assertNotIn(old_label, slide_text + table_text)
+
+
+class AquaLatestResultTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = pd.DataFrame([
+            {'Visual_ID': 'TESTVID001', 'Operation': '7820', 'Unit_Interface_Bin': 15,
+             'Unit_Functional_Bin': 1562, 'Unit_Good_Bad_Flag': 'B',
+             'LATO_Valid_Flag': 'Y', 'Operation_Final_Latest_Flag': 'N',
+             'End_Date_Time': '2026-01-01 10:00:00+08:00'},
+            {'Visual_ID': 'TESTVID001', 'Operation': '7820', 'Unit_Interface_Bin': 1,
+             'Unit_Functional_Bin': 100, 'Unit_Good_Bad_Flag': 'G',
+             'LATO_Valid_Flag': 'Y', 'Operation_Final_Latest_Flag': 'Y',
+             'End_Date_Time': '2026-01-01 10:00:00+08:00'},
+        ])
+
+    def test_selects_final_latest_not_first_or_same_timestamp(self):
+        from utils.ioe_workflow import select_latest_aqua_class_rows
+        for frame in (self.rows, self.rows.iloc[::-1], pd.concat([self.rows, self.rows.iloc[[1]]])):
+            selected = select_latest_aqua_class_rows(frame)
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected.iloc[0]['Unit_Interface_Bin'], 1)
+            self.assertEqual(selected.iloc[0]['Unit_Good_Bad_Flag'], 'G')
+
+    def test_final_latest_can_be_failure(self):
+        from utils.ioe_workflow import select_latest_aqua_class_rows
+        frame = self.rows.copy()
+        frame['Operation_Final_Latest_Flag'] = ['Y', 'N']
+        selected = select_latest_aqua_class_rows(frame)
+        self.assertEqual(selected.iloc[0]['Unit_Interface_Bin'], 15)
+        self.assertEqual(selected.iloc[0]['Unit_Good_Bad_Flag'], 'B')
+
+    def test_requires_valid_lato_and_correct_operation(self):
+        from utils.ioe_workflow import select_latest_aqua_class_rows
+        for column, value in (('LATO_Valid_Flag', 'N'), ('Operation', '1470C')):
+            frame = self.rows.copy()
+            frame.loc[1, column] = value
+            self.assertTrue(select_latest_aqua_class_rows(frame).empty)
+
+    def test_missing_flags_and_conflicting_latest_results_fail(self):
+        from utils.ioe_workflow import select_latest_aqua_class_rows
+        with self.assertRaisesRegex(ValueError, 'Refetch Class data'):
+            select_latest_aqua_class_rows(self.rows.drop(columns=['LATO_Valid_Flag']))
+        frame = self.rows.copy()
+        frame['Operation_Final_Latest_Flag'] = 'Y'
+        with self.assertRaisesRegex(ValueError, 'conflicting final-latest'):
+            select_latest_aqua_class_rows(frame)
+
+    def test_raw_loader_preserves_flags_and_old_cache_is_rejected(self):
+        from utils.aqua_client import _load_result_table, load_cached_aqua_result_workbook
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            raw = folder / 'aqua.txt'
+            self.rows.to_csv(raw, sep='\t', index=False)
+            loaded = _load_result_table(raw)
+            self.assertIn('LATO_Valid_Flag', loaded.columns)
+            self.assertIn('Operation_Final_Latest_Flag', loaded.columns)
+            self.assertEqual(len(loaded), 2)
+            final = folder / 'Final.xlsx'
+            pd.DataFrame({'VISUAL_ID': ['TESTVID001']}).to_excel(final, sheet_name='VID', index=False)
+            cache = folder / 'cache.xlsx'
+            self.rows.drop(columns=['LATO_Valid_Flag']).to_excel(cache, sheet_name='AQUA class_7820', index=False)
+            self.assertIsNone(load_cached_aqua_result_workbook(final, cache))
+            self.rows.to_excel(cache, sheet_name='AQUA class_7820', index=False)
+            self.assertIsNotNone(load_cached_aqua_result_workbook(final, cache))
+
+    def test_workbook_merge_uses_authoritative_bins_and_preserves_aqua_rows(self):
+        from utils.ioe_workflow import apply_aqua_class_bins_to_final_workbook
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'Final.xlsx'
+            pd.DataFrame({'VISUAL_ID': ['TESTVID001'], 'FAB_LOT': ['TESTLOT'],
+                          'FAB_WAFER': [1]}).to_excel(path, sheet_name='CATTS-cleaned', index=False)
+            merged, _ = apply_aqua_class_bins_to_final_workbook(path, aqua_df=self.rows)
+            self.assertEqual(merged.iloc[0]['Class IB'], 1)
+            self.assertEqual(merged.iloc[0]['Class FB'], 100)
+            evidence = pd.read_excel(path, sheet_name='AQUA class_7820')
+            self.assertEqual(len(evidence), 2)
+            self.assertIn('Operation_Final_Latest_Flag', evidence.columns)
 
 
 if __name__ == '__main__':

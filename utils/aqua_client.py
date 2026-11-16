@@ -11,7 +11,7 @@ import pandas as pd
 import requests
 
 from utils.file_io import read_yaml_config
-from utils.ioe_workflow import add_date_stamp_to_path
+from utils.ioe_workflow import AQUA_CLASS_SELECTION_FLAGS, add_date_stamp_to_path
 
 
 DEFAULT_AQUA_CREDENTIALS_PATH = Path("domain-knowledge/wafer-map/AQUA API Key.yaml")
@@ -40,6 +40,13 @@ PREVIEW_COLUMNS = [
     "Unit_Good_Bad_Flag",
     "Start_Date_Time",
     "End_Date_Time",
+    "LATO_Valid_Flag",
+    "Operation_Final_Latest_Flag",
+    "VF_Operation_Final_Latest_Flag",
+    "LOTS_Latest_Flag",
+    "Within_LOTS_Latest_Flag",
+    "Within_LATO_Latest_Flag",
+    "Unit_Testing_Seq_Key",
     "Program_Name",
     "Testing_Entity",
     "Package",
@@ -84,6 +91,8 @@ def load_cached_aqua_result_workbook(
     if aqua_df is None:
         return None
     if "Visual_ID" not in aqua_df.columns:
+        return None
+    if any(column not in aqua_df.columns for column in AQUA_CLASS_SELECTION_FLAGS):
         return None
 
     cached_vids = []
@@ -342,6 +351,9 @@ def _extract_zip_to_folder(zip_path, target_folder):
 def _load_result_table(text_path, operation=DEFAULT_CLASS_OPERATION):
     df = pd.read_csv(text_path, sep="\t")
     filtered = df.loc[df["Operation"].astype(str).eq(str(operation))].copy()
+    missing_flags = [column for column in AQUA_CLASS_SELECTION_FLAGS if column not in filtered.columns]
+    if missing_flags:
+        raise AquaExecutionError(f'AQUA result lacks required validity/latest metadata: {", ".join(missing_flags)}')
     selected_columns = [column for column in PREVIEW_COLUMNS if column in filtered.columns]
     if not selected_columns:
         raise AquaExecutionError("AQUA result did not contain the expected preview columns.")

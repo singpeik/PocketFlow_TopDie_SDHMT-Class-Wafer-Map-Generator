@@ -1,11 +1,13 @@
 import json
 import re
+import os
+from tempfile import NamedTemporaryFile
 from decimal import Decimal, InvalidOperation
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 from utils.file_io import read_yaml_config
 from utils.pyuber_client import execute_query
@@ -44,6 +46,7 @@ VID_TO_IOE_WLA_SHEET = "VID to Wafer&WLA"
 VID_TO_WLA_SHEET = "VID to WLA"
 WLA_SDHMT_SHEET = "WLA lots SDHMT"
 AQUA_CLASS_SHEET = "AQUA class_7820"
+AQUA_CLASS_SELECTION_FLAGS = ('LATO_Valid_Flag', 'Operation_Final_Latest_Flag')
 CATTS_REQUIRED_COLUMNS = [
     "FAB_LOT",
     "FAB_WAFER",
@@ -1068,6 +1071,105 @@ def fetch_sdhmt_for_wla_lots(summary, config_path="config.yaml", query_path="que
     return merged_df, sdhmt_export_df, step4_summary
 
 
+def consolidate_final_workbooks(input_paths, output_path):
+    paths = [Path(path) for path in input_paths]
+    output = Path(output_path)
+    if not paths:
+        raise ValueError('At least one finalized workbook is required.')
+    if output.resolve() in {path.resolve() for path in paths}:
+        raise ValueError('Consolidated output must not overwrite an input workbook.')
+    if output.exists():
+        raise FileExistsError(f'Consolidated output already exists: {output}')
+    sheets = {}
+    source_rows = []
+    for path in paths:
+        with pd.ExcelFile(path) as source:
+            if CATTS_CLEANED_SHEET not in source.sheet_names:
+                raise ValueError(f'{path} does not contain {CATTS_CLEANED_SHEET}.')
+            for name in source.sheet_names:
+                if name == 'Result Summary':
+                    continue
+                frame = pd.read_excel(source, sheet_name=name)
+                sheets.setdefault(name, []).append(frame)
+                if name == CATTS_CLEANED_SHEET:
+                    source_rows.append({'Source Workbook': path.name, 'Die Rows': len(frame)})
+    cleaned = pd.concat(sheets[CATTS_CLEANED_SHEET], ignore_index=True)
+    wafer_keys = cleaned['FAB_LOT'].astype(str).str.strip().str.upper().str[:7] + '_' + _normalize_short_wid_series(cleaned['FAB_WAFER'], 'FAB_WAFER')
+    def die_key(row):
+        wafer = wafer_keys.loc[row.name]
+        if pd.notna(row.get('X_LOCATION')) and pd.notna(row.get('Y_LOCATION')):
+            return (wafer, 'xy', int(row['X_LOCATION']), int(row['Y_LOCATION']))
+        for column in ('INTEL_DIE_INDEX', 'VISUAL_ID'):
+            value = row.get(column)
+            if pd.notna(value) and str(value).strip():
+                return (wafer, column, str(value).strip())
+        return (wafer, 'row', row.name)
+    keys = cleaned.apply(die_key, axis=1)
+    cleaned = cleaned.loc[~keys.duplicated(keep='last')].copy()
+    sheets[CATTS_CLEANED_SHEET] = [cleaned]
+    output.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook(write_only=True)
+    temporary_path = None
+    try:
+        for name, frames in sheets.items():
+            merged = pd.concat(frames, ignore_index=True)
+            if name == VID_SHEET and 'VISUAL_ID' in merged.columns:
+                merged = merged.drop_duplicates(subset=['VISUAL_ID'], keep='last')
+            sheet = workbook.create_sheet(name)
+            sheet.append(list(merged.columns))
+            for values in merged.itertuples(index=False, name=None):
+                sheet.append([None if pd.isna(value) else value for value in values])
+        source_name = 'Consolidation Sources'
+        while source_name in workbook.sheetnames:
+            source_name += '_'
+        sources = workbook.create_sheet(source_name)
+        sources.append(['Source Workbook', 'Die Rows'])
+        for row in source_rows:
+            sources.append([row['Source Workbook'], row['Die Rows']])
+        with NamedTemporaryFile(dir=output.parent, suffix='.xlsx', delete=False) as temporary:
+            temporary_path = Path(temporary.name)
+        workbook.save(temporary_path)
+        workbook.close()
+        os.replace(temporary_path, output)
+    finally:
+        workbook.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return {'output_workbook': str(output), 'source_workbooks': [str(path) for path in paths],
+            'die_rows': len(cleaned), 'duplicate_die_rows_removed': len(keys) - len(cleaned),
+            'wafer_count': int(wafer_keys.loc[cleaned.index].nunique())}
+
+
+def select_latest_aqua_class_rows(aqua_df):
+    if aqua_df.empty:
+        return aqua_df.copy()
+    flags = AQUA_CLASS_SELECTION_FLAGS
+    missing = [column for column in flags if column not in aqua_df.columns]
+    if missing:
+        raise ValueError(
+            'AQUA Class results lack authoritative validity/latest flags. '
+            f'Refetch Class data with these columns: {", ".join(missing)}'
+        )
+    selected = aqua_df.copy()
+    if 'Operation' in selected.columns:
+        selected = selected.loc[pd.to_numeric(selected['Operation'], errors='coerce').eq(7820)].copy()
+    for column in flags:
+        affirmative = selected[column].astype(str).str.strip().str.upper().isin(['Y', 'YES', 'TRUE', '1', '1.0'])
+        selected = selected.loc[affirmative].copy()
+    selected = selected.dropna(subset=['Visual_ID'])
+    selected['Visual_ID'] = selected['Visual_ID'].map(_normalize_visual_id)
+    selected = selected.loc[selected['Visual_ID'].ne('')].copy()
+    bin_columns = ['Unit_Interface_Bin', 'Unit_Functional_Bin']
+    bin_values = selected[bin_columns].apply(pd.to_numeric, errors='raise')
+    conflicts = bin_values.groupby(selected['Visual_ID']).nunique(dropna=False).gt(1).any(axis=1)
+    if conflicts.any():
+        raise ValueError(
+            f'AQUA returned conflicting final-latest Class bins for {int(conflicts.sum())} VID(s). '
+            'Resolve the conflicting authoritative records before reporting.'
+        )
+    return selected.drop_duplicates(subset=['Visual_ID'], keep='first')
+
+
 def apply_aqua_class_bins_to_final_workbook(final_workbook_path, aqua_workbook_path=None, aqua_df=None, aqua_sheet_name=AQUA_CLASS_SHEET):
     final_workbook = Path(final_workbook_path)
     if not final_workbook.exists():
@@ -1105,9 +1207,8 @@ def apply_aqua_class_bins_to_final_workbook(final_workbook_path, aqua_workbook_p
         )
 
     lookup_df = (
-        aqua_df[required_aqua_columns]
+        select_latest_aqua_class_rows(aqua_df)[required_aqua_columns]
         .dropna(subset=["Visual_ID"])
-        .drop_duplicates(subset=["Visual_ID"], keep="first")
         .rename(
             columns={
                 "Unit_Interface_Bin": "Class IB",

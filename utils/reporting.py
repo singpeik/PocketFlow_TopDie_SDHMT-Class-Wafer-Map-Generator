@@ -868,7 +868,220 @@ def _set_wafer_result_caption(text_frame, summary_row, test_name):
                 run.font.color.rgb = RGBColor.from_string(style['font_color'].replace('#', ''))
 
 
-def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_path='IOE MRB map summary.pptx', output_dir='.'):
+def _select_ppt_summary_rows(summary_df, max_rows=15):
+    if len(summary_df) <= max_rows:
+        return summary_df.copy(), ''
+    selected = summary_df.loc[summary_df['Test %'] > 0].copy()
+    note = 'Wafers with Test %=0% are omitted. Full list: Excel Result Summary.'
+    if len(selected) > max_rows:
+        selected = selected.loc[selected['Combined Whole Fails'] > 0].copy()
+        note = ('Only wafers with interest-bin failures are shown in this table. '
+                'Full list: Excel Result Summary.')
+    if selected.empty:
+        note += ' No wafers meet the displayed criteria.'
+    return selected, note
+
+
+def _add_failure_overview_slide(prs, summary_df, product_name):
+    failing = summary_df.loc[summary_df['Combined Whole Fails'] > 0].copy()
+    failing = failing.sort_values(['Combined Whole Fails', 'LOT7_WID3'], ascending=[False, True])
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = f'{product_name} wafers with interest-bin failures ({len(failing)})'
+    for paragraph in slide.shapes.title.text_frame.paragraphs:
+        paragraph.font.size = Pt(24)
+    subtitle = slide.shapes.add_textbox(Inches(0.45), Inches(0.95), Inches(12.4), Inches(0.5))
+    subtitle.text_frame.text = 'Combined Whole Fails > 0 only. Whole / Edge counts combine SDHMT + Class results.'
+    subtitle.text_frame.paragraphs[0].font.size = Pt(13)
+    if failing.empty:
+        message = slide.shapes.add_textbox(Inches(0.5), Inches(1.7), Inches(12.2), Inches(0.6))
+        message.text_frame.text = 'No wafers have combined interest-bin failures.'
+        return slide, {}
+    columns = min(8, max(1, (len(failing) + 19) // 20))
+    rows_per_column = (len(failing) + columns - 1) // columns
+    column_width = 12.4 / columns
+    row_height = min(0.25, 5.05 / rows_per_column)
+    font_size = Pt(12 if columns <= 3 else 9)
+    links = {}
+    fields = ['LOT7_WID3', 'Combined Whole Fails', 'Combined Edge Fails']
+    for column_index, start in enumerate(range(0, len(failing), rows_per_column)):
+        part = failing.iloc[start:start + rows_per_column][fields]
+        links.update(_add_df_to_slide(
+            slide, part, left=Inches(0.45 + column_index * column_width), top=Inches(1.55),
+            width=Inches(column_width - 0.12), height=Inches(0.42 + len(part) * row_height),
+            font_size=font_size, link_col='LOT7_WID3', row_style_fn=_interest_failure_font_style,
+        ))
+        table = slide.shapes[-1].table
+        for field_index, (heading, width_fraction) in enumerate(
+                [('Wafer ID', 0.54), ('Whole Fails', 0.23), ('Edge Fails', 0.23)]):
+            table.columns[field_index].width = Inches((column_width - 0.12) * width_fraction)
+            table.cell(0, field_index).text = heading
+        for row_index, row in enumerate(table.rows):
+            row.height = Inches(0.42 if row_index == 0 else row_height)
+            for field_index, cell in enumerate(row.cells):
+                cell.margin_left = cell.margin_right = Inches(0.04)
+                cell.margin_top = cell.margin_bottom = Inches(0.015)
+                for paragraph in cell.text_frame.paragraphs:
+                    paragraph.space_before = paragraph.space_after = Pt(0)
+                    paragraph.font.size = font_size
+                    if row_index == 0:
+                        paragraph.font.bold = True
+                    if field_index > 0:
+                        paragraph.alignment = 2
+    return slide, links
+
+
+FAILURE_OVERVIEW_COLUMNS = [
+    'LOT7_WID3', 'Total Die Tested', 'Test %', 'SDHMT Tested Dies',
+    'SDHMT Whole Fails', 'SDHMT Edge Fails', 'SDHMT IB15 FB1590-1599', 'SDHMT IB36',
+    'Class Tested Dies', 'Class Whole Fails', 'Class Edge Fails', 'Class IB36',
+    'Combined Whole Fails', 'Combined Edge Fails',
+]
+
+
+def _add_detailed_failure_overview_slide(prs, summary_df, product_name):
+    failing = summary_df.loc[summary_df['Combined Whole Fails'] > 0].copy()
+    failing = failing.sort_values(['Combined Whole Fails', 'LOT7_WID3'], ascending=[False, True])
+    failing = failing[FAILURE_OVERVIEW_COLUMNS]
+    failing['Test %'] = failing['Test %'].map(lambda value: f'{value:.1%}')
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    slide.shapes.title.text = f'{product_name} interest-bin failure detail ({len(failing)} wafers)'
+    slide.shapes.title.left = Inches(0.25)
+    slide.shapes.title.top = Inches(0.12)
+    slide.shapes.title.width = Inches(12.8)
+    slide.shapes.title.height = Inches(0.65)
+    for paragraph in slide.shapes.title.text_frame.paragraphs:
+        paragraph.font.size = Pt(22)
+    if failing.empty:
+        message = slide.shapes.add_textbox(Inches(0.3), Inches(1.0), Inches(12.7), Inches(0.6))
+        message.text_frame.text = 'No wafers have Combined Whole Fails > 0.'
+        return slide, {}
+    row_height = min(0.22, 5.4 / len(failing))
+    font_size = Pt(7.5 if len(failing) > 25 else 9)
+    links = _add_df_to_slide(
+        slide, failing, left=Inches(0.2), top=Inches(0.95), width=Inches(12.9),
+        height=Inches(0.65 + row_height * len(failing)), font_size=font_size,
+        link_col='LOT7_WID3', row_style_fn=_interest_failure_font_style,
+    )
+    table = slide.shapes[-1].table
+    weights = [1.05, 0.7, 0.55, 0.85, 0.8, 0.75, 0.95, 0.65, 0.85, 0.8, 0.75, 0.65, 0.9, 0.9]
+    for column, weight in zip(table.columns, weights):
+        column.width = Inches(12.9 * weight / sum(weights))
+    for row_index, row in enumerate(table.rows):
+        row.height = Inches(0.65 if row_index == 0 else row_height)
+        for column_index, cell in enumerate(row.cells):
+            cell.margin_left = cell.margin_right = Inches(0.015)
+            cell.margin_top = cell.margin_bottom = Inches(0.003)
+            for paragraph in cell.text_frame.paragraphs:
+                paragraph.space_before = paragraph.space_after = Pt(0)
+                paragraph.line_spacing = Pt(8.5 if len(failing) > 25 else 10)
+                paragraph.font.size = font_size
+                if row_index == 0:
+                    paragraph.font.bold = True
+                if column_index > 0:
+                    paragraph.alignment = 2
+    note = slide.shapes.add_textbox(Inches(0.25), Inches(7.05), Inches(12.8), Inches(0.3))
+    note.text_frame.text = 'Only wafers with Combined Whole Fails > 0 are shown. Edge counts use the two-die exterior band.'
+    note.text_frame.paragraphs[0].font.size = Pt(10)
+    return slide, links
+
+
+def _add_wafer_summary_slides(prs, summary_df, product_name, tested_wafers_only=False):
+    max_rows = 15
+    if tested_wafers_only:
+        selected = summary_df.loc[summary_df['Test %'] > 0].copy()
+        note = 'Only wafers with Test % > 0 are shown. Full list: Excel Result Summary.'
+        if selected.empty:
+            note += ' No wafers have test results.'
+    else:
+        selected, note = _select_ppt_summary_rows(summary_df, max_rows)
+    selected['Test %'] = selected['Test %'].map(lambda value: f'{value:.1%}')
+    pages = [selected.iloc[start:start + max_rows] for start in range(0, len(selected), max_rows)]
+    if not pages:
+        pages = [selected]
+    summary_links = {}
+    for page_number, page_df in enumerate(pages, start=1):
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        page_label = f' ({page_number}/{len(pages)})' if len(pages) > 1 else ''
+        slide.shapes.title.text = f'{product_name} wafer test result summary{page_label}'
+        for paragraph in slide.shapes.title.text_frame.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(22)
+        links = _add_df_to_slide(
+            slide, page_df, left=Inches(0.2), top=Inches(1.1),
+            width=Inches(12.9), height=Inches(0.7 + 0.28 * len(page_df)),
+            font_size=Pt(10), link_col='LOT7_WID3', row_style_fn=_interest_failure_font_style,
+        )
+        summary_links.update({wafer: (slide, run) for wafer, run in links.items()})
+        for shape in slide.shapes:
+            if not shape.has_table:
+                continue
+            table = shape.table
+            for column_index, column in enumerate(table.columns):
+                column.width = Inches(1.3 if column_index == 0 else 11.6 / (len(table.columns) - 1))
+            for row_index, row in enumerate(table.rows):
+                row.height = Inches(0.7 if row_index == 0 else 0.28)
+                for cell in row.cells:
+                    cell.margin_left = Inches(0.035)
+                    cell.margin_right = Inches(0.035)
+                    cell.margin_top = Inches(0.015)
+                    cell.margin_bottom = Inches(0.015)
+                    for paragraph in cell.text_frame.paragraphs:
+                        paragraph.space_before = Pt(0)
+                        paragraph.space_after = Pt(0)
+                        paragraph.line_spacing = Pt(11)
+                        if row_index == 0:
+                            paragraph.font.size = Pt(9)
+                            paragraph.font.bold = True
+        if note:
+            note_box = slide.shapes.add_textbox(Inches(0.3), Inches(6.2), Inches(12.6), Inches(0.8))
+            note_box.text_frame.text = note
+            for paragraph in note_box.text_frame.paragraphs:
+                paragraph.font.size = Pt(12)
+    return summary_links
+
+
+def retain_combined_map_slides(prs):
+    combined = {}
+    removed = []
+    for slide in prs.slides:
+        title = slide.shapes.title.text if slide.shapes.title is not None else ''
+        if title.endswith(' SDHMT+Class result'):
+            combined[title.split()[1]] = slide
+        elif title.endswith((' SDHMT result', ' Class result')):
+            removed.append((title.split()[1], slide))
+    if any(wafer not in combined for wafer, _ in removed):
+        raise ValueError('Cannot remove a test map without a matching combined wafer map.')
+    redirects = {slide.part: combined[wafer].part for wafer, slide in removed}
+    relationship_attribute = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id'
+    for slide in prs.slides:
+        if slide.part in redirects:
+            continue
+        for hyperlink in slide._element.xpath('.//a:hlinkClick | .//a:hlinkMouseOver'):
+            relationship_id = hyperlink.get(relationship_attribute)
+            relationship = slide.part.rels.get(relationship_id)
+            if relationship is not None and not relationship.is_external and relationship.reltype == RT.SLIDE:
+                target = redirects.get(relationship.target_part)
+                if target is not None:
+                    replacement_id = slide.part.relate_to(target, RT.SLIDE)
+                    hyperlink.set(relationship_attribute, replacement_id)
+        for relationship in list(slide.part.rels.values()):
+            if (not relationship.is_external and relationship.reltype == RT.SLIDE
+                    and relationship.target_part in redirects):
+                slide.part.drop_rel(relationship.rId)
+    for slide_id in list(prs.slides._sldIdLst):
+        if prs.part.rels[slide_id.rId].target_part in redirects:
+            prs.part.drop_rel(slide_id.rId)
+            prs.slides._sldIdLst.remove(slide_id)
+    for shape in prs.slides[0].shapes:
+        if shape.has_text_frame:
+            for paragraph in shape.text_frame.paragraphs:
+                for run in paragraph.runs:
+                    run.text = run.text.replace('2. SDHMT wafer maps', '2. Combined SDHMT + Class wafer maps')
+                    run.text = run.text.replace('3. Class wafer maps', '').replace('4. Combined wafer maps', '')
+    return len(removed)
+
+
+def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_path='IOE MRB map summary.pptx', output_dir='.', tested_wafers_only=False, combined_maps_only=False):
     final_workbook = Path(final_workbook_path)
     ioe_map = Path(ioe_map_path)
     output_ppt = add_date_stamp_to_path(output_ppt_path, separator='')
@@ -906,7 +1119,11 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
                       if column not in coverage_columns and column != 'Combined Tested Dies'
                       and ' IB15 ' not in column and not column.endswith(' IB36')]
     summary_df = summary_df[coverage_columns + detail_columns]
-    summary_df['Test %'] = summary_df['Test %'].map(lambda value: f'{value:.1%}')
+    summaries_by_wafer = {row['LOT7_WID3']: row for row in summary_rows}
+    total_wafer_count = len(wafer_groups)
+    if tested_wafers_only:
+        wafer_groups = [(wafer, frame) for wafer, frame in wafer_groups
+                        if summaries_by_wafer[wafer]['Total Die Tested'] > 0]
 
     import datetime
     today_str = datetime.date.today().strftime('%m/%d/%Y')
@@ -930,29 +1147,16 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
         for run in paragraph.runs:
             run.font.size = Pt(18)
 
-    slide = prs.slides.add_slide(prs.slide_layouts[5])
-    slide.shapes.title.text = f'{product_name} wafer test result summary'
-    for paragraph in slide.shapes.title.text_frame.paragraphs:
-        for run in paragraph.runs:
-            run.font.size = Pt(22)
-
-    summary_links = _add_df_to_slide(
-        slide,
-        summary_df,
-        title=None,
-        left=Inches(0.2),
-        top=Inches(1.1),
-        width=Inches(12.9),
-        height=Inches(4.9),
-        font_size=Pt(12),
-        link_col='LOT7_WID3',
-        row_style_fn=_interest_failure_font_style,
-    )
+    overview_slide, overview_links = (None, {})
+    if len(summary_df) > 15:
+        overview_slide, overview_links = _add_detailed_failure_overview_slide(prs, pd.DataFrame(summary_rows), product_name)
+    summary_links = _add_wafer_summary_slides(prs, summary_df, product_name, tested_wafers_only)
 
     wafer_target_slides = {}
 
-    for lot7_wid3, wafer_df in wafer_groups:
-        summary_row = _build_step6_summary_row(lot7_wid3, wafer_df, active_dies)
+    for wafer_number, (lot7_wid3, wafer_df) in enumerate(wafer_groups, start=1):
+        summary_row = summaries_by_wafer[lot7_wid3]
+        print(f'Plotting wafer {wafer_number}/{len(wafer_groups)}: {lot7_wid3}', flush=True)
 
         sdhmt_fb_fig = Path(output_dir) / f'{lot7_wid3}_sdhmt_fb.png'
         class_fb_fig = Path(output_dir) / f'{lot7_wid3}_class_fb.png'
@@ -1030,18 +1234,29 @@ def generate_ioe_mrb_summary_ppt(final_workbook_path, ioe_map_path, output_ppt_p
             if fig_path.exists():
                 fig_path.unlink()
 
-    for lot7_wid3, run in summary_links.items():
+    for lot7_wid3, (summary_slide, run) in summary_links.items():
         target_slide = wafer_target_slides.get(lot7_wid3)
         if target_slide is None:
             continue
-        add_internal_link(run, slide, target_slide)
+        add_internal_link(run, summary_slide, target_slide)
         run.font.underline = True
         run.font.color.rgb = RGBColor(0, 0, 255)
 
+    for lot7_wid3, run in overview_links.items():
+        target_slide = wafer_target_slides.get(lot7_wid3)
+        if target_slide is not None:
+            add_internal_link(run, overview_slide, target_slide)
+            run.font.underline = True
+            run.font.color.rgb = RGBColor(0, 0, 255)
+
+    if combined_maps_only:
+        retain_combined_map_slides(prs)
     prs.save(output_ppt)
     return {
         'output_ppt': str(output_ppt),
-        'wafer_count': int(len(summary_rows)),
+        'wafer_count': len(wafer_groups),
+        'total_wafer_count': total_wafer_count,
+        'excluded_zero_test_wafers': total_wafer_count - len(wafer_groups),
         'mdk_outputs': [],
         'summary_rows': summary_rows,
         'summary_sheet': summary_sheet,
